@@ -118,6 +118,8 @@ def _to_public_output(pipeline_result: Dict[str, Any]) -> Dict[str, Any]:
     """Bridge pipeline dict (internal keys like docs) to the public RAGOutput / JSON schema."""
     out = {key: pipeline_result[key] for key in _RAG_KEYS if key in pipeline_result}
     out.update(extract_judge_output(pipeline_result))
+    if pipeline_result.get("image_paths"):
+        out["image_paths"] = pipeline_result["image_paths"]
     # Privacy mode surfaces a PII-free report record + advisory summary, if present
     for key in PRIVACY_OUTPUT_KEYS:
         if key in pipeline_result:
@@ -148,6 +150,7 @@ class RAGOutput(BaseModel):
     input: Optional[str] = None
     context: Optional[str] = None
     answer: Optional[str] = None
+    image_paths: Optional[List[str]] = None
     documents: Optional[List[Dict[str, Any]]] = None
     judge_decision: Optional[str] = None
     judge_reason: Optional[str] = None

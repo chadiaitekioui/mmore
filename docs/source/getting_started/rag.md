@@ -130,6 +130,23 @@ messages = [
 llm.invoke(messages)
 ```
 
+## 👁️ Vision-enabled RAG
+
+Two independent switches:
+
+- `indexer.dense_model.is_multimodal`: dense vectors are computed from text **and** images (re-index after changing it). See [`examples/index/config_vision.yaml`](https://github.com/EPFLiGHT/mmore/blob/main/examples/index/config_vision.yaml).
+- `rag.llm.use_vision`: the answer step also receives the images attached to the retrieved chunks. See [`examples/rag/config_vision.yaml`](https://github.com/EPFLiGHT/mmore/blob/main/examples/rag/config_vision.yaml).
+
+For local Qwen-VL models, install the extra:
+
+```bash
+uv pip install -e ".[qwen]"
+```
+
+Indexing stores each chunk's image paths in Milvus (`image_paths`); the retriever puts them on `Document.metadata` and falls back to text-only fields for collections indexed before that field existed. At generation time, up to `rag.max_images_per_request` images (default 20) are loaded and passed to the vision adapter (local Hugging Face Qwen-VL, or any OpenAI-style vision chat model). Update `rag.system_prompt` so the model is told to use the images — the default text-only prompt does not.
+
+Vision generation and privacy mode are mutually exclusive.
+
 ## 🔧 Customization
 
 Our RAG pipeline is built to take full advantage of [LangChain](https://python.langchain.com/docs/introduction/) abstractions, providing compatibility with all components offered.

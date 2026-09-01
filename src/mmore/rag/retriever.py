@@ -3,9 +3,11 @@ Vector database retriever using Milvus for efficient similarity search.
 Works in conjunction with the Indexer class for document retrieval.
 """
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
+from os import PathLike
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, cast, get_args
 
 import torch
@@ -16,6 +18,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.retrievers import BaseRetriever
 from langchain_milvus.utils.sparse import BaseSparseEmbedding
 from pymilvus import AnnSearchRequest, MilvusClient, WeightedRanker
+from pymilvus.exceptions import MilvusException
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from transformers.modeling_utils import PreTrainedModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -27,6 +30,24 @@ from .model.dense.base import DenseModel, DenseModelConfig
 from .model.sparse.base import SparseModel, SparseModelConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_image_paths(raw: Any) -> List[str]:
+    """Normalize the `image_paths` entity field: None, JSON string or list."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raw = [raw]
+    return [
+        str(path).strip()
+        for path in raw
+        if isinstance(path, (str, PathLike)) and str(path).strip()
+    ]
 
 
 @dataclass
@@ -374,14 +395,33 @@ class Retriever(BaseRetriever):
 
         self._emit_stage("retrieve")
         time_start = time.perf_counter()
-        results = self.retrieve(
-            query=query_input,
-            collection_name=collection_name,
-            partition_names=partition_names,
-            min_score=min_score,
-            k=k,
-            document_ids=document_ids,
-        )
+        try:
+            results = self.retrieve(
+                query=query_input,
+                collection_name=collection_name,
+                partition_names=partition_names,
+                min_score=min_score,
+                k=k,
+                document_ids=document_ids,
+                output_fields=[
+                    "text",
+                    "image_paths",
+                    "paragraph_positions",
+                    "file_path",
+                ],
+            )
+        except MilvusException as e:
+            # Collections indexed before `image_paths` existed: retry default fields.
+            if "image_paths" not in str(e):
+                raise
+            results = self.retrieve(
+                query=query_input,
+                collection_name=collection_name,
+                partition_names=partition_names,
+                min_score=min_score,
+                k=k,
+                document_ids=document_ids,
+            )
         retrieve_elapsed = time.perf_counter() - time_start
 
         def parse_result(result: Dict[str, Any], i: int, offset: int = 0) -> Document:
@@ -393,6 +433,9 @@ class Retriever(BaseRetriever):
                     "similarity": result["distance"],
                     "paragraph_positions": result["entity"].get(
                         "paragraph_positions", []
+                    ),
+                    "image_paths": _parse_image_paths(
+                        result["entity"].get("image_paths")
                     ),
                     "file_path": result["entity"].get("file_path", ""),
                 },

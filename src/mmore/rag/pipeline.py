@@ -5,7 +5,7 @@ Integrates Milvus retrieval with HuggingFace text generation.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union, cast
 
 from langchain_core.documents import Document
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -22,6 +22,12 @@ from ..utils import load_config
 from .judge import JUDGE_OUTPUT_KEYS, JudgeConfig, LLMJudge, retrieve_with_judge
 from .judge.llm import judge_llm_from_config
 from .llm import LLM, LLMConfig
+from .model.vision import (
+    BaseMultimodalLLM,
+    aggregate_image_paths,
+    get_multimodal_llm,
+    load_images_from_paths,
+)
 from .retriever import Retriever, RetrieverConfig
 from .types import MMOREInput, MMOREOutput
 
@@ -46,6 +52,7 @@ class RAGConfig:
     retriever: RetrieverConfig
     llm: LLMConfig = field(default_factory=lambda: LLMConfig(llm_name="gpt2"))
     system_prompt: str = DEFAULT_PROMPT
+    max_images_per_request: int = 20
     judge: Optional[JudgeConfig] = None
 
 
@@ -61,14 +68,22 @@ class RAGPipeline:
         retriever: Retriever,
         prompt_template: Union[str, ChatPromptTemplate],
         llm: Optional[BaseChatModel] = None,
+        use_vision: bool = False,
+        multimodal_llm: Optional[BaseMultimodalLLM] = None,
+        max_images_per_request: int = 20,
         judge: Optional[LLMJudge] = None,
         privacy_graph: Optional[Any] = None,
         privacy_approver: Optional[PrivacyApprover] = None,
     ):
+        if privacy_graph is None and use_vision and multimodal_llm is None:
+            raise ValueError("Vision mode requires a multimodal LLM.")
         # Get modules
         self.retriever = retriever
         self.prompt = prompt_template
         self.llm = llm
+        self.use_vision = use_vision
+        self.multimodal_llm = multimodal_llm
+        self.max_images_per_request = max_images_per_request
         self.judge = judge
         self.privacy_graph = privacy_graph
         # Answers the gate's interrupts when the privacy config is interactive
@@ -80,9 +95,12 @@ class RAGPipeline:
             RAGPipeline.format_docs,
             self.prompt,
             self.llm,
-            self.judge,
-            self.privacy_graph,
-            self.privacy_approver,
+            use_vision=self.use_vision,
+            multimodal_llm=self.multimodal_llm,
+            max_images_per_request=self.max_images_per_request,
+            judge=self.judge,
+            privacy_graph=self.privacy_graph,
+            privacy_approver=self.privacy_approver,
         )
 
     def __str__(self):
@@ -99,7 +117,18 @@ class RAGPipeline:
             config = load_config(config, RAGConfig)
 
         retriever = Retriever.from_config(config.retriever)
-        llm = None if privacy_graph is not None else LLM.from_config(config.llm)
+        if privacy_graph is not None:
+            if config.llm.use_vision:
+                raise ValueError("Privacy mode and vision mode are mutually exclusive.")
+            llm: Optional[BaseChatModel] = None
+            multimodal_llm = None
+        elif config.llm.use_vision:
+            llm = None
+            multimodal_llm = get_multimodal_llm(config.llm)
+            multimodal_llm._load()
+        else:
+            llm = LLM.from_config(config.llm)
+            multimodal_llm = None
         judge = (
             LLMJudge(llm=judge_llm_from_config(config.judge.llm), config=config.judge)
             if config.judge
@@ -110,7 +139,15 @@ class RAGPipeline:
         )
 
         return cls(
-            retriever, chat_template, llm, judge, privacy_graph, privacy_approver
+            retriever,
+            chat_template,
+            llm,
+            use_vision=config.llm.use_vision,
+            multimodal_llm=multimodal_llm,
+            max_images_per_request=config.max_images_per_request,
+            judge=judge,
+            privacy_graph=privacy_graph,
+            privacy_approver=privacy_approver,
         )
 
     @staticmethod
@@ -126,6 +163,9 @@ class RAGPipeline:
         format_docs,
         prompt,
         llm,
+        use_vision=False,
+        multimodal_llm=None,
+        max_images_per_request=20,
         judge=None,
         privacy_graph=None,
         privacy_approver=None,
@@ -137,6 +177,10 @@ class RAGPipeline:
         def make_output(x):
             """Validate the output of the LLM and keep only the actual answer of the assistant"""
             res_dict = MMOREOutput.model_validate(x).model_dump()
+            if use_vision and multimodal_llm is not None:
+                res_dict["image_paths"] = aggregate_image_paths(x["docs"])[
+                    :max_images_per_request
+                ]
             res_dict["answer"] = res_dict["answer"].split("<|im_start|>assistant\n")[-1]
             # Expose formatted context and judge correction logs in the API response (context is not on MMOREOutput).
             for key in (
@@ -151,6 +195,25 @@ class RAGPipeline:
             return res_dict
 
         validate_output = RunnableLambda(make_output)
+
+        def answer_with_vision(x: Dict[str, Any]) -> str:
+            images = load_images_from_paths(
+                aggregate_image_paths(x["docs"]), max_images=max_images_per_request
+            )
+            # Keep the chat roles instead of flattening the prompt into one blob.
+            system_parts: List[str] = []
+            user_parts: List[str] = []
+            for message in prompt.invoke(
+                {"context": x["context"], "input": x["input"]}
+            ).to_messages():
+                is_system = getattr(message, "type", None) == "system"
+                (system_parts if is_system else user_parts).append(str(message.content))
+            return multimodal_llm.invoke_with_images(
+                text="\n\n".join(part for part in user_parts if part),
+                images=images,
+                system_prompt="\n\n".join(part for part in system_parts if part)
+                or None,
+            )
 
         # Only retrieval differs (retriever vs judge); format context and generate answer unchanged.
         if judge is not None:
@@ -171,6 +234,8 @@ class RAGPipeline:
                 RAGPipeline._privacy_answer_step(privacy_graph, privacy_approver)
             )
             core_chain = with_context | answer_step
+        elif use_vision and multimodal_llm is not None:
+            core_chain = with_context.assign(answer=RunnableLambda(answer_with_vision))
         else:
             if llm is None:
                 raise ValueError("RAGPipeline needs an LLM when privacy mode is off.")
@@ -218,6 +283,9 @@ class RAGPipeline:
         else:
             queries_list = queries
 
+        if self.use_vision and self.multimodal_llm is not None:
+            # Vision generation is memory-heavy: keep the batch sequential.
+            config = cast(RunnableConfig, {"max_concurrency": 1, **(config or {})})
         results = self.rag_chain.batch(queries_list, config=config)
 
         if return_dict:

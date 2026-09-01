@@ -1,0 +1,14 @@
+# Multimodal dense indexing: dense vectors see text + images, sparse stays text-only.
+indexer:
+  dense_model:
+    model_name: Qwen/Qwen2.5-VL-3B-Instruct
+    is_multimodal: true
+    max_images: 20
+  sparse_model:
+    model_name: splade
+    is_multimodal: false
+  db:
+    uri: ./proc_demo.db
+    name: my_db
+collection_name: my_docs
+documents_path: 'examples/postprocessor/outputs/merged/results.jsonl'

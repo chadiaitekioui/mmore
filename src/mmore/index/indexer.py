@@ -3,6 +3,7 @@ Simple vector database indexer using Milvus for document storage.
 Supports multimodal documents with chunking capabilities.
 """
 
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional, cast
@@ -112,6 +113,11 @@ class Indexer:
         else:
             return [doc.text.replace("<attachment>", "") for doc in documents]
 
+    @staticmethod
+    def _image_paths(sample: MultimodalSample) -> str:
+        """JSON list of image modalities, stored as a dynamic Milvus field."""
+        return json.dumps([m.value for m in sample.modalities if m.type == "image"])
+
     def _create_collection_with_schema(self, collection_name: str):
         """Create Milvus collection with fields for both embeddings."""
         fields = [
@@ -202,6 +208,8 @@ class Indexer:
                         "dense_embedding": d,
                         "sparse_embedding": s,
                         **sample.metadata.to_dict(),
+                        # Dynamic field, set last so metadata cannot clobber it
+                        "image_paths": Indexer._image_paths(sample),
                     }
                     for sample, d, s in zip(batch, dense_embeddings, sparse_embeddings)
                 ]
